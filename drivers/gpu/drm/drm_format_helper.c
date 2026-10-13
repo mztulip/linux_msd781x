@@ -1010,11 +1010,12 @@ int drm_fb_blit(struct iosys_map *dst, const unsigned int *dst_pitch, uint32_t d
 		const struct drm_rect *clip)
 {
 	uint32_t fb_format = fb->format->format;
-	
-	drm_fb_rgb565_to_rgbx4444(dst, dst_pitch, src, fb, clip);
-		//drm_fb_memcpy(dst, dst_pitch, src, fb, clip);
-	return 0;
 
+	/*
+	 * Kronus: the forced RGB565 -> xRGB4444 conversion that was here matched
+	 * GOP format 2 (ARGB4444) set by `osd_create`. MBoot now runs logofix,
+	 * which leaves GOP3 in format 1 = real RGB565, so plain memcpy is right.
+	 */
 	if (fb_format == dst_format) {
 		drm_fb_memcpy(dst, dst_pitch, src, fb, clip);
 		return 0;
