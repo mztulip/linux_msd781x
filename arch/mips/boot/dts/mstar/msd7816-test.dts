@@ -85,20 +85,28 @@
 	};
 };
 
+/*
+ * Port 0, pad mode 1 (chiptop 0x1E12 = 1, as set by MBoot's tuner_init).
+ * The only device answering on this bus is the MxL5007T tuner at 0x60.
+ */
 &miic0 {
 	#address-cells = <1>;
 	#size-cells = <0>;
+	mstar,chiptop = <&chiptop>;
+	mstar,port = <0>;
+	mstar,pad-mode = <1>;
 	status = "okay";
+};
 
-	temp-sensor@4c {
-		compatible = "gmt,g781";
-		reg = <0x4c>;
-		#thermal-sensor-cells = <1>;
-	};
-
-	rtc@68 {
-		compatible = "dallas,ds1340";
-		reg = <0x68>;
+&riu {
+	/*
+	 * Front panel: FD650-style key/display controller bit-banged on PM SAR
+	 * pins 1 (DIO) and 2 (CLK). reg covers the SAR pin mode/GPIO registers
+	 * 0x1422-0x1425 (PM bank 0x1400 + 0x20 words).
+	 */
+	front-panel@2840 {
+		compatible = "mstar,msd7816-fd650-panel";
+		reg = <0x2840 0x10>;
 	};
 };
 
