@@ -1490,6 +1490,15 @@ config I2C_VIRTIO
           This driver can also be built as a module. If so, the module
           will be called i2c-virtio.
 
+config I2C_MSTAR_MIIC
+	tristate "MStar MSD7816/MSD7818 (Kronus) I2C master"
+	depends on MSTAR_MIPS || COMPILE_TEST
+	depends on OF
+	select MFD_SYSCON
+	help
+	  Hardware I2C master of MStar Kronus set-top-box SoCs
+	  (MSD7816/MSD7818), a Philips SIO1 style byte engine.
+
 config I2C_MSC313E
 	tristate "MStar MSC313E I2C driver"
 	select REGMAP_MMIO
