@@ -296,6 +296,15 @@ config KEYBOARD_TCA8418
 	  To compile this driver as a module, choose M here: the
 	  module will be called tca8418_keypad.
 
+config KEYBOARD_MSTAR_FD650
+	tristate "MStar Kronus FD650 front panel (keys + 7-segment display)"
+	depends on MSTAR_MIPS || COMPILE_TEST
+	depends on OF
+	help
+	  Front panel of MStar MSD7816/MSD7818 set-top boxes: an FD650/TM1650
+	  style controller bit-banged on PM SAR pins. Reports POWER/CH+/CH-
+	  keys and exposes the 4-digit display via sysfs.
+
 config KEYBOARD_MATRIX
 	tristate "GPIO driven matrix keypad support"
 	depends on GPIOLIB || COMPILE_TEST
