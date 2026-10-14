@@ -32,6 +32,11 @@ https://github.com/mztulip/msd7818_rootfs_kernel
   so the kernel copies RGB565 as is and gets 65536 colours.
   **This kernel needs `logofix` instead of `osd_create`** in `bootlinux`,
   otherwise colours are wrong.
+- **Double buffered framebuffer** `drivers/video/fbdev/mstar-gopfb.c`
+  (`CONFIG_FB_MSTAR_GOP`, built in, replaces simpledrm): `/dev/fb0` is
+  1920x1080 RGB565 with `yres_virtual` = 2160. `FBIOPAN_DISPLAY` switches
+  buffers at vsync, `FBIO_WAITFORVSYNC` waits for it (the output runs at
+  50 Hz). The DTS reserves 9 MB at `0x2100000` (`fb-memory`).
 - **Config**: `arch/mips/configs/wiwa_hd95_defconfig`.
 
 ```
