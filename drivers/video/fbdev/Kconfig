@@ -1915,6 +1915,17 @@ config FB_HYPERV
 	help
 	  This framebuffer driver supports Microsoft Hyper-V Synthetic Video.
 
+config FB_MSTAR_GOP
+	tristate "MStar Kronus GOP3 framebuffer (double buffered)"
+	depends on FB && OF
+	depends on MSTAR_MIPS || COMPILE_TEST
+	select FB_IOMEM_HELPERS
+	help
+	  Framebuffer on the GOP3 layer of MStar MSD7816/MSD7818 set-top
+	  boxes, as left by MBoot (logofix). Adds panning between buffers at
+	  vsync (FBIOPAN_DISPLAY) and FBIO_WAITFORVSYNC. Replaces
+	  simple-framebuffer/simpledrm on these boards.
+
 config FB_SIMPLE
 	tristate "Simple framebuffer support"
 	depends on FB

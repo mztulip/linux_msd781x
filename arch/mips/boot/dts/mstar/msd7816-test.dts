@@ -25,8 +25,9 @@
 		#size-cells = <1>;
 		ranges;
 
-		fb-memory@2100000 {
-			reg = <0x2100000 0x400000>;
+		/* two 1920x1080 RGB565 buffers for mstar-gopfb (2 x 0x3f4800) */
+		fb_memory: fb-memory@2100000 {
+			reg = <0x2100000 0x900000>;
 		};
 
 		/* ve framebuffer */
@@ -38,15 +39,6 @@
 		tsukasa@3c00000 {
 			reg = <0x3c00000 0x400000>;
 		};
-	};
-
-	framebuffer@2100000 {
-		compatible = "simple-framebuffer";
-		reg = <0x2100000 0x400000>;
-		width = <1920>;
-		height = <1080>;
-		stride = <(1920*2)>;
-		format = "r5g6b5";
 	};
 };
 
@@ -120,4 +112,18 @@
 
 &piu_uart0 {
 	status = "okay";
+};
+
+/*
+ * Linux framebuffer on GOP3, double buffered (mstar-gopfb). Buffer 0 is the
+ * one MBoot/logofix leave on screen at 0x2100000.
+ */
+&riu {
+	gop3-fb@203e00 {
+		compatible = "mstar,msd7816-gop3-fb";
+		reg = <0x203e00 0x200>;
+		memory-region = <&fb_memory>;
+		width = <1920>;
+		height = <1080>;
+	};
 };

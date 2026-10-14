@@ -125,6 +125,7 @@ obj-$(CONFIG_FB_VGA16)            += vga16fb.o
 obj-$(CONFIG_FB_OF)               += offb.o
 obj-$(CONFIG_FB_DA8XX)		  += da8xx-fb.o
 obj-$(CONFIG_FB_SSD1307)	  += ssd1307fb.o
+obj-$(CONFIG_FB_MSTAR_GOP)        += mstar-gopfb.o
 obj-$(CONFIG_FB_SIMPLE)           += simplefb.o
 
 # the test framebuffer is last
