@@ -121,7 +121,9 @@
 &riu {
 	gop3-fb@203e00 {
 		compatible = "mstar,msd7816-gop3-fb";
-		reg = <0x203e00 0x200>;
+		reg = <0x203e00 0x200>,		/* GOP regs 0x1F00-0x1FFF */
+		      <0x202400 0x200>;		/* MIU0 regs 0x1200-0x12FF (arbitration) */
+		interrupts-extended = <&intc_irq 20 IRQ_TYPE_LEVEL_HIGH>;	/* GOP vsync */
 		memory-region = <&fb_memory>;
 		width = <1920>;
 		height = <1080>;

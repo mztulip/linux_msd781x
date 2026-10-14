@@ -8,20 +8,35 @@
  * driver takes the layer over and adds:
  *
  *   - yres_virtual = N * yres, with N buffers in the reserved memory region,
- *   - FBIOPAN_DISPLAY: the new buffer address is latched at the next vsync
- *     (the call does not wait for it),
- *   - FBIO_WAITFORVSYNC: waits until a pending flip is done, or for the next
- *     vsync when nothing is pending.
+ *   - FBIOPAN_DISPLAY: remembers the new buffer address; the vsync interrupt
+ *     handler writes it (the call does not wait),
+ *   - FBIO_WAITFORVSYNC: sleeps until a pending flip is done, or until the
+ *     next vsync when nothing is pending.
  *
  * GOP registers are banked: reg 0x1FFE selects the bank. GOP3 uses bank 0xA
- * for its window (GWIN) and bank 0x9 for control. Writing the control bank
- * with bit 10 (trigger) set latches the pending GOP3 registers at the next
- * vsync; bit 15 stays 1 until that happens, and changing the bank select
- * before it drops cancels the update. See docs/grafika_gop.md in the reverse
- * engineering notes.
+ * for its window (GWIN) and bank 0x9 for control.
+ *
+ * Flipping works like MStar's GFLIP driver (libapiGOP: _MDrv_GFLIP_IntHandler,
+ * MHal_GFLIP_SetFlipToGop): on the GOP vsync interrupt (intc IRQ 20, status
+ * bit 8 of bank 9 reg 0x1F10, enabled by bits [1:0] = 2) the address is
+ * written and applied at once with the force-write bit (0x1FFE bit 9), so it
+ * always changes right after vsync. Latching it with the trigger bit (10)
+ * at an arbitrary moment of the frame gave occasional shifted/garbage frames
+ * under memory load (fbDOOM). See docs/grafika_gop.md and
+ * docs/sterownik_gopfb.md in the reverse engineering notes.
+ *
+ * Memory arbitration: with the MIU defaults the GOP loses against the CPU
+ * when the CPU does scattered writes (a game drawing columns), its read
+ * FIFO runs dry and HDMI shows shifted lines / garbage for a frame even
+ * though the framebuffer content is fine. If the node has a second reg
+ * range (MIU0 regs 0x1200-0x12FF), the driver gives MIU client group 1
+ * (the GOP clients, as in MStar's clientTbl) high priority and puts that
+ * group first in the group arbitration order (what MHal_MIU_SetHPriorityMask
+ * and HAL_MIU_SetGroupPriority do).
  */
 
 #include <linux/fb.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
@@ -29,6 +44,7 @@
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
+#include <linux/wait.h>
 
 #define DRIVER_NAME		"mstar-gopfb"
 
@@ -37,6 +53,7 @@
 #define GOP_GWIN_ADDR_L		0x004	/* bank A 0x1F02: buffer address / 8, low */
 #define GOP_GWIN_ADDR_H		0x008	/* bank A 0x1F04: high */
 #define GOP_GWIN_PITCH		0x024	/* bank A 0x1F12: bytes / 8 */
+#define GOP_INT			0x020	/* bank 9 0x1F10: [1:0] int masks, bit 8 vsync status */
 #define GOP_BANKSEL		0x1fc	/* 0x1FFE */
 
 #define GOP_FMT_SHIFT		4
@@ -47,8 +64,19 @@
 #define BANK_IDLE		0x7000	/* upper bits as left by MBoot */
 #define BANK_GOP3_CTRL		0x9
 #define BANK_GOP3_GWIN		0xa
+#define BANK_FORCE_WRITE	BIT(9)	/* writes take effect immediately */
 #define BANK_TRIGGER		BIT(10)
 #define BANK_ACK_GOP3		BIT(15)	/* 1 = waiting for vsync */
+
+#define INT_MASK		0x3
+#define INT_VSYNC_ON		0x2	/* values from MHal_GFLIP_IntEnable */
+#define INT_VSYNC_OFF		0x3
+#define INT_VSYNC_STATUS	BIT(8)
+
+/* offsets from the second reg base (RIU 0x1F202400 = MIU0 reg 0x1200) */
+#define MIU_GROUP_HPMASK(g)	((0x48 + (g) * 0x20) * 2)	/* 1 = no high priority */
+#define MIU_GROUP_ORDER		(0xfe * 2)	/* [7:0] 4 x 2 bit, bit 8 applies */
+#define MIU_GOP_GROUP		1
 
 #define VSYNC_TIMEOUT_US	100000	/* 50 Hz output: 20 ms period */
 
@@ -59,14 +87,13 @@ MODULE_PARM_DESC(buffers, "number of 1920x1080 buffers (limited by the memory re
 struct gopfb {
 	void __iomem *regs;
 	phys_addr_t base;
-	spinlock_t lock;		/* bank select and the trigger sequence */
+	spinlock_t lock;		/* bank select, flip state */
+	u32 flip_addr;			/* address / 8 to show at the next vsync */
+	bool flip_pending;
+	unsigned int vsync_count;
+	wait_queue_head_t vsync_wait;
 	u32 pseudo_palette[16];
 };
-
-static bool gopfb_pending(struct gopfb *g)
-{
-	return readw(g->regs + GOP_BANKSEL) & BANK_ACK_GOP3;
-}
 
 /* wait until the previous latch is done; caller holds g->lock */
 static int gopfb_wait_idle_atomic(struct gopfb *g)
@@ -84,40 +111,116 @@ static void gopfb_trigger(struct gopfb *g)
 	writew(BANK_IDLE | BANK_GOP3_CTRL, g->regs + GOP_BANKSEL);
 }
 
-static int gopfb_pan_display(struct fb_var_screeninfo *var, struct fb_info *info)
+/* GOP vsync interrupt: apply a pending flip, clear the status, wake waiters */
+static irqreturn_t gopfb_irq(int irq, void *data)
 {
-	struct gopfb *g = info->par;
-	u32 addr = (g->base + var->yoffset * info->fix.line_length) >> 3;
-	unsigned long flags;
-	int ret;
+	struct gopfb *g = data;
+	u16 v;
 
-	if (var->xoffset || var->yoffset + info->var.yres > info->var.yres_virtual)
-		return -EINVAL;
-
-	spin_lock_irqsave(&g->lock, flags);
-	ret = gopfb_wait_idle_atomic(g);
-	if (!ret) {
-		writew(BANK_IDLE | BANK_GOP3_GWIN, g->regs + GOP_BANKSEL);
-		writew(addr & 0xffff, g->regs + GOP_GWIN_ADDR_L);
-		writew(addr >> 16, g->regs + GOP_GWIN_ADDR_H);
-		gopfb_trigger(g);	/* bank select stays on 9 until the ACK */
+	spin_lock(&g->lock);
+	writew(BANK_IDLE | BANK_GOP3_CTRL, g->regs + GOP_BANKSEL);
+	v = readw(g->regs + GOP_INT);
+	if (!(v & INT_VSYNC_STATUS)) {
+		writew(BANK_IDLE, g->regs + GOP_BANKSEL);
+		spin_unlock(&g->lock);
+		return IRQ_NONE;
 	}
-	spin_unlock_irqrestore(&g->lock, flags);
-	return ret;
+
+	if (g->flip_pending) {
+		/* like MHal_GFLIP_SetFlipToGop: write, then force it in now */
+		writew(BANK_IDLE | BANK_GOP3_GWIN, g->regs + GOP_BANKSEL);
+		writew(g->flip_addr & 0xffff, g->regs + GOP_GWIN_ADDR_L);
+		writew(g->flip_addr >> 16, g->regs + GOP_GWIN_ADDR_H);
+		writew(BANK_IDLE | BANK_FORCE_WRITE | BANK_GOP3_GWIN, g->regs + GOP_BANKSEL);
+		writew(BANK_IDLE | BANK_GOP3_GWIN, g->regs + GOP_BANKSEL);
+		g->flip_pending = false;
+		writew(BANK_IDLE | BANK_GOP3_CTRL, g->regs + GOP_BANKSEL);
+	}
+
+	/* clear the status by masking and unmasking (_MDrv_GFLIP_IntHandler) */
+	writew((v & ~INT_MASK) | INT_VSYNC_OFF, g->regs + GOP_INT);
+	writew((v & ~INT_MASK) | INT_VSYNC_ON, g->regs + GOP_INT);
+	writew(BANK_IDLE, g->regs + GOP_BANKSEL);
+	g->vsync_count++;
+	spin_unlock(&g->lock);
+
+	wake_up_all(&g->vsync_wait);
+	return IRQ_HANDLED;
 }
 
-static int gopfb_wait_for_vsync(struct gopfb *g)
+/* give the display (GOP) memory requests priority over the CPU */
+static void gopfb_miu_priority(struct device *dev, void __iomem *miu)
+{
+	u16 order = readw(miu + MIU_GROUP_ORDER);
+	u16 hp = readw(miu + MIU_GROUP_HPMASK(MIU_GOP_GROUP));
+
+	/* all clients of the group high priority */
+	writew(0x0000, miu + MIU_GROUP_HPMASK(MIU_GOP_GROUP));
+	/*
+	 * group order, 2 bits per slot from the highest priority: was 0xe4
+	 * (0, 1, 2, 3), now 0xe1 (1, 0, 2, 3); bit 8 high-low applies it
+	 */
+	order = (order & ~0xff) | 0xe1;
+	writew(order | BIT(8), miu + MIU_GROUP_ORDER);
+	writew(order, miu + MIU_GROUP_ORDER);
+	dev_info(dev, "MIU: group %d high priority (mask 0x%04x -> 0x0000), order 0x%02x\n",
+		 MIU_GOP_GROUP, hp, order & 0xff);
+}
+
+static void gopfb_vsync_irq(struct gopfb *g, bool on)
 {
 	unsigned long flags;
 	u16 v;
 
 	spin_lock_irqsave(&g->lock, flags);
-	if (!gopfb_pending(g))
-		gopfb_trigger(g);	/* nothing pending: a latch is a vsync wait */
+	writew(BANK_IDLE | BANK_GOP3_CTRL, g->regs + GOP_BANKSEL);
+	v = readw(g->regs + GOP_INT);
+	writew((v & ~INT_MASK) | (on ? INT_VSYNC_ON : INT_VSYNC_OFF), g->regs + GOP_INT);
+	writew(BANK_IDLE, g->regs + GOP_BANKSEL);
 	spin_unlock_irqrestore(&g->lock, flags);
+}
 
-	return readw_poll_timeout(g->regs + GOP_BANKSEL, v, !(v & BANK_ACK_GOP3),
-				  500, VSYNC_TIMEOUT_US);
+static int gopfb_pan_display(struct fb_var_screeninfo *var, struct fb_info *info)
+{
+	struct gopfb *g = info->par;
+	unsigned long flags;
+
+	if (var->xoffset || var->yoffset + info->var.yres > info->var.yres_virtual)
+		return -EINVAL;
+
+	spin_lock_irqsave(&g->lock, flags);
+	g->flip_addr = (g->base + var->yoffset * info->fix.line_length) >> 3;
+	g->flip_pending = true;		/* the next vsync interrupt shows it */
+	spin_unlock_irqrestore(&g->lock, flags);
+	return 0;
+}
+
+static bool gopfb_flip_done(struct gopfb *g, unsigned int start)
+{
+	unsigned long flags;
+	bool done;
+
+	spin_lock_irqsave(&g->lock, flags);
+	done = !g->flip_pending && g->vsync_count != start;
+	spin_unlock_irqrestore(&g->lock, flags);
+	return done;
+}
+
+/*
+ * Wait for the pending flip (it happens at the next vsync), or for the next
+ * vsync when nothing is pending. After it returns the previous buffer is no
+ * longer scanned out and can be drawn into.
+ */
+static int gopfb_wait_for_vsync(struct gopfb *g)
+{
+	unsigned int start = READ_ONCE(g->vsync_count);
+	long ret;
+
+	ret = wait_event_interruptible_timeout(g->vsync_wait, gopfb_flip_done(g, start),
+					       usecs_to_jiffies(VSYNC_TIMEOUT_US));
+	if (ret < 0)
+		return ret;
+	return ret ? 0 : -ETIMEDOUT;
 }
 
 static int gopfb_ioctl(struct fb_info *info, unsigned int cmd, unsigned long arg)
@@ -171,9 +274,10 @@ static int gopfb_probe(struct platform_device *pdev)
 	struct fb_info *info;
 	struct gopfb *g;
 	u32 width, height, pitch, frame, nbuf;
+	struct resource *res;
 	unsigned long flags;
 	u16 ctrl;
-	int ret;
+	int irq, ret;
 
 	if (of_property_read_u32(dev->of_node, "width", &width) ||
 	    of_property_read_u32(dev->of_node, "height", &height))
@@ -198,6 +302,7 @@ static int gopfb_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	g = info->par;
 	spin_lock_init(&g->lock);
+	init_waitqueue_head(&g->vsync_wait);
 	g->base = rmem->base;
 
 	g->regs = devm_platform_ioremap_resource(pdev, 0);
@@ -252,12 +357,37 @@ static int gopfb_probe(struct platform_device *pdev)
 		writew(addr >> 16, g->regs + GOP_GWIN_ADDR_H);
 		writew(pitch >> 3, g->regs + GOP_GWIN_PITCH);
 		gopfb_trigger(g);
+		/* the bank select must not change before the latch is done */
+		ret = gopfb_wait_idle_atomic(g);
+		writew(BANK_IDLE, g->regs + GOP_BANKSEL);
 	}
 	spin_unlock_irqrestore(&g->lock, flags);
 	if (ret) {
 		dev_err(dev, "GOP3 does not answer (no vsync ACK)\n");
 		goto err_release;
 	}
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	if (res) {
+		/* plain ioremap: the MIU node in common.dtsi covers the same range */
+		void __iomem *miu = devm_ioremap(dev, res->start, resource_size(res));
+
+		if (miu)
+			gopfb_miu_priority(dev, miu);
+	}
+
+	/* vsync interrupt: flips are done there */
+	irq = platform_get_irq(pdev, 0);
+	if (irq < 0) {
+		ret = irq;
+		goto err_release;
+	}
+	ret = devm_request_irq(dev, irq, gopfb_irq, 0, DRIVER_NAME, g);
+	if (ret) {
+		dev_err(dev, "cannot get IRQ %d\n", irq);
+		goto err_release;
+	}
+	gopfb_vsync_irq(g, true);
 	if (((ctrl & GOP_FMT_MASK) >> GOP_FMT_SHIFT) != GOP_FMT_RGB565)
 		dev_warn(dev, "GOP3 was in format %u, switched to RGB565 (use logofix, not osd_create)\n",
 			 (ctrl & GOP_FMT_MASK) >> GOP_FMT_SHIFT);
@@ -267,8 +397,8 @@ static int gopfb_probe(struct platform_device *pdev)
 		goto err_release;
 	platform_set_drvdata(pdev, info);
 
-	dev_info(dev, "fb%d: %ux%u RGB565, %u buffers at %pa\n",
-		 info->node, width, height, nbuf, &rmem->base);
+	dev_info(dev, "fb%d: %ux%u RGB565, %u buffers at %pa, vsync IRQ %d\n",
+		 info->node, width, height, nbuf, &rmem->base, irq);
 	return 0;
 
 err_release:
@@ -280,6 +410,7 @@ static void gopfb_remove(struct platform_device *pdev)
 {
 	struct fb_info *info = platform_get_drvdata(pdev);
 
+	gopfb_vsync_irq(info->par, false);
 	unregister_framebuffer(info);
 	framebuffer_release(info);
 }
